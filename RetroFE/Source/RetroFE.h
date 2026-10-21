@@ -22,6 +22,7 @@
 #include "Database/MetadataDatabase.h"
 #include "Execute/AttractMode.h"
 #include "Graphics/FontCache.h"
+#include "Utility/RenderStats.h"
 #include "Video/IVideo.h"
 #include "Video/VideoFactory.h"
 #include <SDL/SDL.h>
@@ -132,6 +133,7 @@ private:
     AttractMode        attract_;
     bool               menuMode_;
     bool               mustRender_;
+    RenderStats        renderStats_;
 
     std::map<std::string, unsigned int> lastMenuOffsets_;
     std::map<std::string, std::string>  lastMenuPlaylists_;

@@ -33,6 +33,7 @@
 #include "Graphics/Page.h"
 #include "Graphics/Component/ScrollingList.h"
 #include "Graphics/Component/Video.h"
+#include "Graphics/Component/AnimatedImage.h"
 #include "Video/VideoFactory.h"
 #include <algorithm>
 #include <dirent.h>
@@ -104,6 +105,7 @@ void RetroFE::render( )
 {
 
     SDL_LockMutex( SDL::getMutex( ) );
+    uint64_t statsStartUs = renderStats_.enabled( ) ? RenderStats::nowUs( ) : 0;
     //SDL_SetRenderDrawColor( SDL::getRenderer( ), 0x0, 0x0, 0x00, 0xFF );
     //SDL_RenderClear( SDL::getRenderer( ) );
     SDL_FillRect(SDL::getWindow( ), NULL, SDL_MapRGB(SDL::getWindow( )->format, 0, 0, 0));
@@ -134,8 +136,15 @@ void RetroFE::render( )
     }
 #endif //DEBUG_FPS
 
+    uint64_t statsDrawnUs = renderStats_.enabled( ) ? RenderStats::nowUs( ) : 0;
+
     //SDL_Flip(SDL::getWindow( ));
     SDL::renderAndFlipWindow();
+
+    if ( renderStats_.enabled( ) )
+    {
+        renderStats_.addRender( statsDrawnUs - statsStartUs, RenderStats::nowUs( ) - statsDrawnUs );
+    }
 
     SDL_UnlockMutex( SDL::getMutex( ) );
 
@@ -232,6 +241,10 @@ void RetroFE::launchExit( )
     // Restore time settings
     currentTime_ = static_cast<float>( GET_RUN_TIME_MS ) / 1000;
     lastLaunchReturnTime_ = currentTime_;
+
+    // Coming back from a game counts as activity for animated images
+    AnimatedImage::notifyUserActivity( );
+    renderStats_.reset( );
 
 }
 
@@ -359,6 +372,20 @@ void RetroFE::run( )
     VideoFactory::setNumLoops( videoLoop );
     VideoFactory::createVideo( ); // pre-initialize the gstreamer engine
     Video::setEnabled( videoEnable );
+
+    // Animated images: on/off, frame rate cap and seconds without input before they slow down or pause
+    bool animationEnable      = true;
+    int  animationMaxFps      = 30;
+    int  animationIdleTimeout = 30;
+    config_.getProperty( "animationEnable", animationEnable );
+    config_.getProperty( "animationMaxFps", animationMaxFps );
+    config_.getProperty( "animationIdleTimeout", animationIdleTimeout );
+    AnimatedImage::configure( animationEnable, static_cast<float>( animationMaxFps ), static_cast<float>( animationIdleTimeout ) );
+
+    // Optional render/memory statistics, written every few seconds
+    std::string renderStatsFile;
+    config_.getProperty( "renderStatsFile", renderStatsFile );
+    renderStats_.setFile( renderStatsFile );
 
     // Init thread
     bool initMetaDbtmp;
@@ -967,6 +994,8 @@ void RetroFE::run( )
             printf("Menu launched here\n");
             res = MenuMode::launch();
             menuMode_ = false;
+            AnimatedImage::notifyUserActivity( );
+            renderStats_.reset( );
             forceRender(true);
 
             /// Clear events
@@ -1076,6 +1105,8 @@ void RetroFE::run( )
 		ticks_last_refresh = static_cast<int>(GET_RUN_TIME_MS);
 #endif  //PERIOD_FORCE_REFRESH
             }
+
+            renderStats_.tick( );
         }
     }
 }
@@ -1186,6 +1217,14 @@ RetroFE::RETROFE_STATE RetroFE::processUserInput( Page *page )
         }
 
         input_.update(e);
+
+        // Any button press or release wakes up idle animated images
+        if ( e.type == SDL_KEYDOWN || e.type == SDL_KEYUP ||
+             e.type == SDL_JOYBUTTONDOWN || e.type == SDL_JOYBUTTONUP ||
+             e.type == SDL_JOYAXISMOTION || e.type == SDL_JOYHATMOTION )
+        {
+            AnimatedImage::notifyUserActivity( );
+        }
     }
 #endif
 
