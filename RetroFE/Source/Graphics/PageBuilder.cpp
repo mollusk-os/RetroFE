@@ -26,6 +26,7 @@
 #include "Component/ReloadableScrollingText.h"
 #include "Component/ScrollingList.h"
 #include "Component/Video.h"
+#include "Component/AnimatedImage.h"
 #include "Animate/AnimationEvents.h"
 #include "Animate/TweenTypes.h"
 #include "../Sound/Sound.h"
@@ -375,6 +376,75 @@ bool PageBuilder::buildComponents(xml_node<> *layout, Page *page)
         xml_attribute<> *indexXml = componentXml->first_attribute("menuIndex");
         int index = indexXml ? Utils::convertInt(indexXml->value()) : -1;
         page->pushMenu(scrollingList, index);
+    }
+
+    // Animated images are added first so that, within a layer, they are drawn below everything else
+    for(xml_node<> *componentXml = layout->first_node("animatedImage"); componentXml; componentXml = componentXml->next_sibling("animatedImage"))
+    {
+        xml_attribute<> *src            = componentXml->first_attribute("src");
+        xml_attribute<> *idXml          = componentXml->first_attribute("id");
+        xml_attribute<> *frameWidthXml  = componentXml->first_attribute("frameWidth");
+        xml_attribute<> *frameHeightXml = componentXml->first_attribute("frameHeight");
+        xml_attribute<> *fpsXml         = componentXml->first_attribute("fps");
+        xml_attribute<> *idleFpsXml     = componentXml->first_attribute("idleFps");
+        xml_attribute<> *loopXml        = componentXml->first_attribute("loop");
+        xml_attribute<> *colorKeyXml    = componentXml->first_attribute("transparentColor");
+
+        if (!src)
+        {
+            Logger::write(Logger::ZONE_ERROR, "Layout", "animatedImage component in layout does not specify a source file");
+            continue;
+        }
+
+        std::string filePath;
+        filePath = Utils::combinePath(Configuration::convertToAbsolutePath(layoutPath, filePath), std::string(src->value()));
+        std::string layoutName;
+        config_.getProperty("layout", layoutName);
+        std::string altFilePath = Utils::combinePath(userLayout_?Configuration::userPath:Configuration::absolutePath,
+            "layouts", layoutName, std::string(src->value()));
+
+        // Frames default to the full screen size
+        int   frameWidth  = frameWidthXml  ? Utils::convertInt(frameWidthXml->value())  : screenWidth_;
+        int   frameHeight = frameHeightXml ? Utils::convertInt(frameHeightXml->value()) : screenHeight_;
+        float fps         = fpsXml         ? Utils::convertFloat(fpsXml->value())       : 15.f;
+        float idleFps     = idleFpsXml     ? Utils::convertFloat(idleFpsXml->value())   : 0.f;
+
+        bool loop = true;
+        if (loopXml)
+        {
+            std::string value = Utils::toLower(loopXml->value());
+            loop = !(value == "false" || value == "no" || value == "0");
+        }
+
+        // transparentColor="RRGGBB": pixels of that color (after conversion to RGB565) are not drawn
+        bool   useColorKey = false;
+        Uint32 colorKey    = 0;
+        if (colorKeyXml)
+        {
+            int intColor = 0;
+            std::stringstream ss;
+            ss << std::hex << colorKeyXml->value();
+            ss >> intColor;
+            int red   = (intColor >> 16) & 0xFF;
+            int green = (intColor >> 8) & 0xFF;
+            int blue  = intColor & 0xFF;
+            colorKey    = ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3);
+            useColorKey = true;
+        }
+
+        AnimatedImage *c = new AnimatedImage(filePath, altFilePath, frameWidth, frameHeight, fps, idleFps,
+                                             loop, useColorKey, colorKey, *page, scaleX_, scaleY_);
+        c->setId( idXml ? Utils::convertInt(idXml->value()) : -1 );
+        xml_attribute<> *menuScrollReload = componentXml->first_attribute("menuScrollReload");
+        if (menuScrollReload &&
+            (Utils::toLower(menuScrollReload->value()) == "true" ||
+             Utils::toLower(menuScrollReload->value()) == "yes"))
+        {
+            c->setMenuScrollReload(true);
+        }
+        buildViewInfo(componentXml, c->baseViewInfo);
+        loadTweens(c, componentXml);
+        page->addComponent(c);
     }
 
     for(xml_node<> *componentXml = layout->first_node("container"); componentXml; componentXml = componentXml->next_sibling("container"))
