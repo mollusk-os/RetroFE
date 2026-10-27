@@ -19,10 +19,10 @@
 #include "../../Utility/Log.h"
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -34,7 +34,7 @@ bool   AnimatedImage::enabled_           = true;
 float  AnimatedImage::maxFps_            = 30.f;
 float  AnimatedImage::idleTimeout_       = 30.f;
 Uint32 AnimatedImage::lastActivityTicks_ = 0;
-size_t AnimatedImage::mappedBytes_       = 0;
+size_t AnimatedImage::frameFileBytes_    = 0;
 
 
 AnimatedImage::AnimatedImage(std::string file, std::string altFile, int frameWidth, int frameHeight,
@@ -54,9 +54,10 @@ AnimatedImage::AnimatedImage(std::string file, std::string altFile, int frameWid
     , colorKey_(colorKey)
     , scaleX_(scaleX)
     , scaleY_(scaleY)
-    , fd_(-1)
-    , map_(NULL)
-    , mapLength_(0)
+    , fileBytes_(0)
+    , frame_(NULL)
+    , loadedFrame_(-1)
+    , warnedRead_(false)
     , surface_(NULL)
     , phase_(0)
     , currentFrame_(0)
@@ -88,13 +89,14 @@ void AnimatedImage::notifyUserActivity()
 }
 
 
-size_t AnimatedImage::mappedBytes()
+size_t AnimatedImage::frameFileBytes()
 {
-    return mappedBytes_;
+    return frameFileBytes_;
 }
 
 
-bool AnimatedImage::mapFile(const std::string &path)
+// Checks that path holds at least one frame, and makes it the file in use
+bool AnimatedImage::openFile(const std::string &path)
 {
     int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if(fd < 0)
@@ -130,54 +132,114 @@ bool AnimatedImage::mapFile(const std::string &path)
         ss.str("");
     }
 
-    size_t length = frames * frameBytes_;
-    void  *map    = mmap(NULL, length, PROT_READ, MAP_SHARED, fd, 0);
-    if(map == MAP_FAILED)
-    {
-        ss << "Could not map " << path << ": " << strerror(errno);
-        Logger::write(Logger::ZONE_ERROR, "AnimatedImage", ss.str());
-        close(fd);
-        return false;
-    }
-
-#ifdef MADV_WILLNEED
+#ifdef POSIX_FADV_WILLNEED
     // Start reading the frames in the background so the first loop does not wait on the SD card
-    madvise(map, length, MADV_WILLNEED);
+    posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
 #endif
+    close(fd);
 
-    fd_           = fd;
-    map_          = map;
-    mapLength_    = length;
-    frameCount_   = static_cast<int>(frames);
-    mappedBytes_ += length;
+    path_            = path;
+    fileBytes_       = frames * frameBytes_;
+    frameCount_      = static_cast<int>(frames);
+    frameFileBytes_ += fileBytes_;
 
-    ss << "Mapped " << frameCount_ << " frames of " << frameWidth_ << "x" << frameHeight_
-       << " (" << (length / 1024) << " KB) from " << path;
+    ss << "Using " << frameCount_ << " frames of " << frameWidth_ << "x" << frameHeight_
+       << " (" << (fileBytes_ / 1024) << " KB) from " << path;
     Logger::write(Logger::ZONE_INFO, "AnimatedImage", ss.str());
 
     return true;
 }
 
 
-void AnimatedImage::unmapFile()
+// Reads a frame into frame_. The file is open only for this read, so it
+// never keeps its drive busy. On failure frame_ keeps the previous frame.
+bool AnimatedImage::loadFrame(int frame)
 {
-    if(map_)
+    std::stringstream ss;
+
+    int fd = open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+    if(fd < 0)
     {
-        munmap(map_, mapLength_);
-        mappedBytes_ -= mapLength_;
-        map_          = NULL;
-        mapLength_    = 0;
+        if(!warnedRead_)
+        {
+            warnedRead_ = true;
+            ss << "Cannot open " << path_ << " (" << strerror(errno) << "); keeping the current frame";
+            Logger::write(Logger::ZONE_WARNING, "AnimatedImage", ss.str());
+        }
+        return false;
     }
 
-    if(fd_ >= 0)
+    // The file may have been replaced (e.g. from a computer, over USB)
+    struct stat st;
+    if(fstat(fd, &st) == 0)
     {
-#ifdef POSIX_FADV_DONTNEED
-        // Drop the cached frames now, so whatever runs next (usually a game) gets that memory back
-        posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
-#endif
-        close(fd_);
-        fd_ = -1;
+        size_t frames = static_cast<size_t>(st.st_size) / frameBytes_;
+        size_t bytes  = frames * frameBytes_;
+        if(bytes != fileBytes_ && frames >= 1)
+        {
+            frameFileBytes_ = frameFileBytes_ - fileBytes_ + bytes;
+            fileBytes_      = bytes;
+            frameCount_     = static_cast<int>(frames);
+        }
     }
+
+    size_t done = 0;
+    int    err  = 0;
+    if(frame >= 0 && frame < frameCount_)
+    {
+        off_t offset = static_cast<off_t>(frame) * static_cast<off_t>(frameBytes_);
+        while(done < frameBytes_)
+        {
+            ssize_t n = pread(fd, frame_ + done, frameBytes_ - done, offset + static_cast<off_t>(done));
+            if(n < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            if(n <= 0)
+            {
+                err = (n < 0) ? errno : 0;
+                break;
+            }
+            done += static_cast<size_t>(n);
+        }
+    }
+    close(fd);
+
+    if(done < frameBytes_)
+    {
+        if(!warnedRead_)
+        {
+            warnedRead_ = true;
+            ss << "Cannot read frame " << frame << " of " << path_
+               << (err ? std::string(" (") + strerror(err) + ")" : std::string(" (file too short)"))
+               << "; keeping the current frame";
+            Logger::write(Logger::ZONE_WARNING, "AnimatedImage", ss.str());
+        }
+        return false;
+    }
+
+    if(warnedRead_)
+    {
+        warnedRead_ = false;
+        Logger::write(Logger::ZONE_INFO, "AnimatedImage", "Reading " + path_ + " again");
+    }
+    loadedFrame_ = frame;
+    return true;
+}
+
+
+// Drops the file from the page cache, so whatever runs next (usually a game)
+// gets that memory back
+void AnimatedImage::dropFileCache()
+{
+#ifdef POSIX_FADV_DONTNEED
+    int fd = open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+    if(fd >= 0)
+    {
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+    }
+#endif
 }
 
 
@@ -201,25 +263,50 @@ void AnimatedImage::allocateGraphicsMemory()
 
     SDL_LockMutex(SDL::getMutex());
 
-    bool mapped = mapFile(file_);
-    if(!mapped && altFile_ != "" && altFile_ != file_)
+    bool found = openFile(file_);
+    if(!found && altFile_ != "" && altFile_ != file_)
     {
-        mapped = mapFile(altFile_);
+        found = openFile(altFile_);
     }
 
-    if(mapped)
+    if(found)
     {
-        surface_ = SDL_CreateRGBSurfaceFrom(map_, frameWidth_, frameHeight_, 16, frameWidth_ * 2,
-                                            0xF800, 0x07E0, 0x001F, 0);
+        // Resume where we left off (e.g. after a game), unless the file changed under us
+        if(currentFrame_ >= frameCount_)
+        {
+            phase_        = 0;
+            currentFrame_ = 0;
+        }
+
+        loadedFrame_ = -1;
+        frame_       = static_cast<Uint8 *>(malloc(frameBytes_));
+        if(!frame_)
+        {
+            Logger::write(Logger::ZONE_ERROR, "AnimatedImage", "Out of memory for a frame of " + path_);
+        }
+        else if(loadFrame(currentFrame_))
+        {
+            surface_ = SDL_CreateRGBSurfaceFrom(frame_, frameWidth_, frameHeight_, 16, frameWidth_ * 2,
+                                                0xF800, 0x07E0, 0x001F, 0);
+            if(!surface_)
+            {
+                Logger::write(Logger::ZONE_ERROR, "AnimatedImage", "Could not create frame surface: " + std::string(SDL_GetError()));
+            }
+            else if(useColorKey_)
+            {
+                // No SDL_RLEACCEL: RLE would cache the first frame and the animation would stop
+                SDL_SetColorKey(surface_, SDL_SRCCOLORKEY, colorKey_);
+            }
+        }
+
         if(!surface_)
         {
-            Logger::write(Logger::ZONE_ERROR, "AnimatedImage", "Could not create frame surface: " + std::string(SDL_GetError()));
-            unmapFile();
-        }
-        else if(useColorKey_)
-        {
-            // No SDL_RLEACCEL: RLE would cache the first frame and the animation would stop
-            SDL_SetColorKey(surface_, SDL_SRCCOLORKEY, colorKey_);
+            free(frame_);
+            frame_           = NULL;
+            loadedFrame_     = -1;
+            frameFileBytes_ -= fileBytes_;
+            fileBytes_       = 0;
+            path_.clear();
         }
     }
     else
@@ -234,13 +321,6 @@ void AnimatedImage::allocateGraphicsMemory()
     {
         baseViewInfo.ImageWidth  = frameWidth_ * scaleX_;
         baseViewInfo.ImageHeight = frameHeight_ * scaleY_;
-
-        // Resume where we left off (e.g. after a game), unless the file changed under us
-        if(currentFrame_ >= frameCount_)
-        {
-            phase_        = 0;
-            currentFrame_ = 0;
-        }
         drawnFrame_ = -1;
     }
 }
@@ -258,10 +338,20 @@ void AnimatedImage::freeGraphicsMemory()
     }
     SDL_UnlockMutex(SDL::getMutex());
 
-    if(map_ || fd_ >= 0)
+    if(frame_)
     {
-        unmapFile();
-        Logger::write(Logger::ZONE_INFO, "AnimatedImage", "Released " + file_);
+        free(frame_);
+        frame_ = NULL;
+    }
+    loadedFrame_ = -1;
+
+    if(!path_.empty())
+    {
+        dropFileCache();
+        frameFileBytes_ -= fileBytes_;
+        fileBytes_       = 0;
+        Logger::write(Logger::ZONE_INFO, "AnimatedImage", "Released " + path_);
+        path_.clear();
     }
 
     drawnFrame_ = -1;
@@ -349,7 +439,11 @@ void AnimatedImage::draw()
         return;
     }
 
-    surface_->pixels = static_cast<Uint8 *>(map_) + static_cast<size_t>(currentFrame_) * frameBytes_;
+    // If the frame can't be read (the drive is shared with a computer), the previous one stays
+    if(currentFrame_ != loadedFrame_)
+    {
+        loadFrame(currentFrame_);
+    }
 
     SDL_Rect rect;
     rect.x = static_cast<int>(baseViewInfo.XRelativeToOrigin());

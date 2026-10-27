@@ -145,12 +145,12 @@ void RenderStats::write(double seconds)
     double flipAvgMs  = renders_ ? static_cast<double>(flipTotalUs_) / renders_ / 1000.0 : 0.0;
 
     fprintf(f, "t=%.0fs renders=%u (%.1f/s) draw=%.2fms avg %.2fms max flip=%.2fms avg cpu=%.1f%% "
-               "rss=%ldkB anon=%ldkB file=%ldkB anim_mapped=%lukB\n",
+               "rss=%ldkB anon=%ldkB file=%ldkB anim_file=%lukB\n",
             static_cast<double>(nowUs()) / 1000000.0,
             renders_, renders_ / seconds,
             drawAvgMs, static_cast<double>(drawMaxUs_) / 1000.0, flipAvgMs,
             cpuPercent,
             statusKb("VmRSS"), statusKb("RssAnon"), statusKb("RssFile"),
-            static_cast<unsigned long>(AnimatedImage::mappedBytes() / 1024));
+            static_cast<unsigned long>(AnimatedImage::frameFileBytes() / 1024));
     fclose(f);
 }
